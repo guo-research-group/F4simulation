@@ -100,7 +100,7 @@ def simulation_focaltrack(params, texture):
 
     plotSingleResult(
         list_Z, list_Z_true, "./focaltrack.png",
-        title="", normalisation=False
+        title="Focal Track", normalisation=False
     )
 
 
@@ -180,6 +180,51 @@ def simulation_stereo(params, texture):
     )
 
 
+def simulation_mmdp(params, texture):
+    ray_offset = params.get("ray_offset", 1.0e-3)  # lenslet-to-sensor distance (meters)
+    angles = np.linspace(-0.05, 0.05, params.get("N_angles", 5))  # angular sampling in radians
+
+    def capture_measurement(texture, depth):
+        combined = np.zeros_like(texture)
+        for theta in angles:
+            shift_px = int(np.round((ray_offset * np.tan(theta)) / (depth * PIXEL_PITCH)))
+            shifted = shift_texture_physically(texture, shift_px)
+            combined += shifted
+        return combined / len(angles)
+
+    list_Z = []
+    list_Z_true = []
+
+    for depth in WORKING_RANGE:
+        observed = capture_measurement(texture, depth)
+
+        # Search for best matching depth
+        best_Z = None
+        min_loss = float('inf')
+        for d_test in WORKING_RANGE:
+            pred = capture_measurement(texture, d_test)
+            loss = np.mean((observed - pred) ** 2)
+            if loss < min_loss:
+                min_loss = loss
+                best_Z = d_test
+
+        depth_estimate = np.full(SENSOR_SIZE, best_Z)
+        depth_true = np.full(SENSOR_SIZE, depth)
+
+        print(f"[MMDP] True Z: {depth:.2f} m | Estimated Z: {best_Z:.2f} m")
+
+        list_Z.append(depth_estimate)
+        list_Z_true.append(depth_true)
+
+    list_Z = np.array(list_Z)
+    list_Z_true = np.array(list_Z_true)
+
+    plotSingleResult(
+        list_Z, list_Z_true, "./mmdp.png",
+        title="MMDP", normalisation=False
+    )
+
+
 def main():
     params = {
         "rho": 10.1,
@@ -189,11 +234,14 @@ def main():
         "sensorDistance": 0.1100,
         "photon_per_brightness_level": 240,
         "kernelSize": 5,
+        "ray_offset": 1.0e-3,  # distance from microlens or aperture to sensor (in meters)
+        "N_angles": 5,         # number of angular samples
     }
     texture = get_sine_1d_texture(1000, 255, 0, SENSOR_SIZE, PIXEL_PITCH)
 
     simulation_focaltrack(params, texture)
     simulation_stereo(params, texture)
+    simulation_mmdp(params, texture)
 
 
     return
