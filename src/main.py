@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pdb
+from scipy.optimize import minimize_scalar
+from scipy.sparse.linalg import lsqr
+from scipy.optimize import minimize
 
 PIXEL_PITCH = 5.86 * 1e-6
 SENSOR_SIZE = 200
@@ -179,50 +182,214 @@ def simulation_stereo(params, texture):
         title="Stereo", normalisation=False
     )
 
+def transmissionFigure():
+    theta = np.linspace(0, 80, 501)
+    theta = np.deg2rad(theta)
+    metasurface_distance = np.linspace(0, 5, 501)
+    frequency = np.pi + np.abs(np.sin(3 * np.pi * metasurface_distance) * np.pi * metasurface_distance)
+    transmissions = []
+    for f in  frequency:
+        transmissions.append(np.abs(np.cos(f * (theta - np.pi/6))))
+    transmissions = np.array(transmissions).T
+
+    fig = plt.figure(figsize=(10, 5), dpi=100)
+    ax = fig.add_subplot(1, 1, 1)
+    ax.imshow(
+        transmissions, aspect='auto', extent=[0, 5, 0, 80],
+        origin='upper', cmap='viridis'
+    )
+    ax.set_xlabel("Distance (m)")
+
+    plt.show()
+
+def augular_transmission(theta, distance):
+    """
+    T(theta, d(t))
+    Response transmission of the sensor at angle theta and distance d(t).
+    For now it is just a raw estimation based on a sinusoidal function.
+    """
+    frequency = np.pi + np.abs(np.sin(3 * np.pi * distance) * np.pi * distance)
+    transmission = np.abs(np.cos(frequency * (theta - np.pi/6)))
+
+    return transmission
 
 def simulation_mmdp(params, texture):
-    ray_offset = params.get("ray_offset", 1.0e-3)  # lenslet-to-sensor distance (meters)
-    angles = np.linspace(-0.05, 0.05, params.get("N_angles", 5))  # angular sampling in radians
+    metasurface_distances = np.linspace(0, 5, 30)
+    # 1 mm for each pixel of the texture
+    texture_pixiel_size = 1e-3
 
-    def capture_measurement(texture, depth):
-        combined = np.zeros_like(texture)
-        for theta in angles:
-            shift_px = int(np.round((ray_offset * np.tan(theta)) / (depth * PIXEL_PITCH)))
-            shifted = shift_texture_physically(texture, shift_px)
-            combined += shifted
-        return combined / len(angles)
+    texture_coordinates = np.zeros((len(texture), 2))
+    texture_coordinates[:, 0] = (np.arange(len(texture)) - len(texture) // 2) * texture_pixiel_size
 
-    list_Z = []
-    list_Z_true = []
+    sensor_coordinates = np.zeros((SENSOR_SIZE, 2))
+    sensor_coordinates[:, 0] = (np.arange(SENSOR_SIZE) - SENSOR_SIZE // 2) * PIXEL_PITCH
 
     for depth in WORKING_RANGE:
-        observed = capture_measurement(texture, depth)
+        # Simulate light field at different depths
+        # Light field (y, depth, theta)
+        light_field = []
+        images = np.zeros((SENSOR_SIZE, len(metasurface_distances)))
 
-        # Search for best matching depth
-        best_Z = None
-        min_loss = float('inf')
-        for d_test in WORKING_RANGE:
-            pred = capture_measurement(texture, d_test)
-            loss = np.mean((observed - pred) ** 2)
-            if loss < min_loss:
-                min_loss = loss
-                best_Z = d_test
+        for i in range(SENSOR_SIZE):
+            y_diff = texture_coordinates[:, 0] - sensor_coordinates[i, 0]
+            theta = np.arctan2(y_diff, depth)
+            distance_squared = texture_coordinates[:, 0] ** 2 + depth ** 2
+            light_field.append(np.array([texture_coordinates[:, 0], np.full(len(texture_coordinates[:, 0]), depth), theta]).T)
+            for j, d in enumerate(metasurface_distances):
+                transmission = augular_transmission(theta, d)
+                images[i, j] += np.sum(texture / distance_squared * transmission)
+        light_field = np.array(light_field)
+        
 
-        depth_estimate = np.full(SENSOR_SIZE, best_Z)
-        depth_true = np.full(SENSOR_SIZE, depth)
 
-        print(f"[MMDP] True Z: {depth:.2f} m | Estimated Z: {best_Z:.2f} m")
+def simulation_mmdp(params, texture):
+    metasurface_distances = np.linspace(0, 5, 30)
 
-        list_Z.append(depth_estimate)
-        list_Z_true.append(depth_true)
+    # Precompute coordinates
+    N = texture.size
+    tex_coords = (np.arange(N) - N//2) * 1e-3        # 1 mm per texture pixel
+    sensor_coords = (np.arange(SENSOR_SIZE) - SENSOR_SIZE//2) * PIXEL_PITCH
+    y_diff = tex_coords[None, :] - sensor_coords[:, None]  # shape: (SENSOR_SIZE, N)
 
-    list_Z = np.array(list_Z)
-    list_Z_true = np.array(list_Z_true)
+    # Loop over true depths
+    Z_est_list = []
+    Z_true_list = []
 
-    plotSingleResult(
-        list_Z, list_Z_true, "./mmdp.png",
-        title="MMDP", normalisation=False
-    )
+    for depth_true in WORKING_RANGE:
+        # Simulate measurement stack at this true depth
+        images = np.zeros((SENSOR_SIZE, metasurface_distances.size))
+        dist2_true = y_diff**2 + depth_true**2
+        for j, d in enumerate(metasurface_distances):
+            theta_true = np.arctan2(y_diff, depth_true)
+            T = augular_transmission(theta_true, d)
+            images[:, j] = np.sum(texture[None, :] / dist2_true * T, axis=1)
+
+        # Depth estimation per pixel via Eq. (4) MLE (no regularization)
+        def predict_pixel(i, Z_trial):
+            dist2 = y_diff[i]**2 + Z_trial**2
+            theta = np.arctan2(y_diff[i], Z_trial)
+            stack = np.array([
+                np.sum(texture / dist2 * augular_transmission(theta, d))
+                for d in metasurface_distances
+            ])
+            return stack
+
+        Z_est = np.zeros(SENSOR_SIZE)
+        for i in range(SENSOR_SIZE):
+            I_obs = images[i]
+
+            def cost(Z_trial):
+                I_pred = predict_pixel(i, Z_trial)
+                return np.sum((I_obs - I_pred)**2)
+
+            res = minimize_scalar(cost, bounds=(WORKING_RANGE.min(), WORKING_RANGE.max()), method='bounded')
+            Z_est[i] = res.x
+
+        Z_est_list.append(Z_est)
+        Z_true_list.append(np.full(SENSOR_SIZE, depth_true))
+        print(f"[MMDP] True Z={depth_true:.2f} m, Mean Z_est={Z_est.mean():.2f} m")
+
+    Z_est_arr = np.array(Z_est_list)
+    Z_true_arr = np.array(Z_true_list)
+    plotSingleResult(Z_est_arr, Z_true_arr, "./mmdp.png", title="MMDP Optimization")
+
+
+def forward_stack(P, z, d_list):
+    """
+    Forward model: predict measurement stack I_pred[k,j] for each sensor pixel k and metasurface distance j.
+    """
+    K = len(z)
+    M = len(d_list)
+    I_pred = np.zeros((K, M))
+    # Precompute coordinates
+    tex_coords = (np.arange(K) - K//2) * 1e-3           # 1 mm per texture pixel
+    sensor_coords = (np.arange(K) - K//2) * PIXEL_PITCH
+    for j, d in enumerate(d_list):
+        for k in range(K):
+            dx = tex_coords - sensor_coords[k]          # vector over scene points m
+            theta = np.arctan2(dx, z)
+            falloff = P / (dx**2 + z**2)
+            T = augular_transmission(theta, d)
+            I_pred[k, j] = np.sum(falloff * T)
+    return I_pred
+
+def reconstruct_MMDP(I_obs, d_list, z0, P0, lambda_z=1e-2, lambda_P=1e-2, max_iters=5):
+    """
+    Alternating minimization to recover depth z and appearance P from observations I_obs.
+    """
+    K, M = I_obs.shape
+    z = z0.copy()
+    P = P0.copy()
+
+    for it in range(max_iters):
+        # 1) Solve for P (linear least squares with ridge)
+        rows = K*M; cols = K
+        A = np.zeros((rows, cols))
+        b = I_obs.flatten()
+        for j, d in enumerate(d_list):
+            I_row = j*K
+            for k in range(K):
+                dx = (np.arange(K)-k) * PIXEL_PITCH
+                theta = np.arctan2(dx, z)
+                G = 1.0/(dx**2 + z**2) * augular_transmission(theta, d)
+                A[I_row + k, :] = G
+        P = lsqr(A, b, damp=lambda_P)[0]
+
+        # 2) Solve for z (nonlinear)
+        def cost_z(z_vec):
+            I_pred = forward_stack(P, z_vec, d_list)
+            diff = I_pred - I_obs
+            smooth = lambda_z * np.sum((z_vec[1:] - z_vec[:-1])**2)
+            return np.sum(diff**2) + smooth
+
+        res = minimize(
+            cost_z, z, method='L-BFGS-B',
+            bounds=[(WORKING_RANGE.min(), WORKING_RANGE.max())]*K
+        )
+        z = res.x
+
+        print(f"Iter {it+1}/{max_iters}: cost={res.fun:.2e}, mean(z)={z.mean():.3f} m")
+
+    return z, P
+
+def simulation_mmdp(params, texture):
+    """
+    1) Simulate MMDP image stack across WORKING_RANGE of true depths
+    2) Reconstruct z,P via alternating minimization (Eq. 4 model)
+    """
+    d_list = np.linspace(0, 5, 30)
+    K = SENSOR_SIZE
+
+    Z_est_list = []
+    Z_true_list = []
+
+    for depth_true in WORKING_RANGE:
+        # simulate measurements I_obs[k,j]
+        I_obs = np.zeros((K, len(d_list)))
+        tex_coords = (np.arange(K) - K//2) * 1e-3
+        sensor_coords = (np.arange(K) - K//2) * PIXEL_PITCH
+        for j, d in enumerate(d_list):
+            for k in range(K):
+                dx = tex_coords - sensor_coords[k]
+                theta = np.arctan2(dx, depth_true)
+                falloff = texture / (dx**2 + depth_true**2)
+                T = augular_transmission(theta, d)
+                I_obs[k, j] = np.sum(falloff * T)
+
+        # initialize and reconstruct
+        z0 = np.full(K, depth_true)
+        P0 = np.ones(K)
+        z_est, P_est = reconstruct_MMDP(I_obs, d_list, z0, P0)
+
+        print(f"[MMDP] True Z={depth_true:.2f} m → Mean Z_est={z_est.mean():.2f} m")
+
+        Z_est_list.append(z_est)
+        Z_true_list.append(np.full(K, depth_true))
+
+    Z_est_arr = np.array(Z_est_list)
+    Z_true_arr = np.array(Z_true_list)
+    plotSingleResult(Z_est_arr, Z_true_arr, "./mmdp_new.png", title="MMDP Reconstruction")
+
 
 
 def main():
@@ -234,14 +401,13 @@ def main():
         "sensorDistance": 0.1100,
         "photon_per_brightness_level": 240,
         "kernelSize": 5,
-        "ray_offset": 1.0e-3,  # distance from microlens or aperture to sensor (in meters)
-        "N_angles": 5,         # number of angular samples
     }
     texture = get_sine_1d_texture(1000, 255, 0, SENSOR_SIZE, PIXEL_PITCH)
 
-    simulation_focaltrack(params, texture)
-    simulation_stereo(params, texture)
+    # simulation_focaltrack(params, texture)
+    # simulation_stereo(params, texture)
     simulation_mmdp(params, texture)
+    # transmissionFigure()
 
 
     return
