@@ -3,11 +3,15 @@ import numpy as np
 import pdb
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import minimize_scalar
+from scipy.ndimage import shift as sp_shift
 import matplotlib.pyplot as plt
+import os
 
 PIXEL_PITCH = 5.86 * 1e-6
 SENSOR_SIZE = 200
-WORKING_RANGE = np.linspace(0.30, 2.70, 81)
+# WORKING_RANGE = np.linspace(0.30, 2.70, 81)
+WORKING_RANGE = np.linspace(1000, 10000, 91)
+# WORKING_RANGE = np.linspace(1, 1000, 100)
 LAPLACIAN_KERNEL = np.array([-1, 2, -1]) / (PIXEL_PITCH**2)
 HEATMAP_RANGE = [
     [WORKING_RANGE.min(), WORKING_RANGE.max()],
@@ -158,15 +162,374 @@ def simulation_mmdp():
     )
 
 
+def simulation_mmdp_hack():
+    metasurface_distances = np.linspace(12.5, 150, 30)
+    # 1 mm for each pixel of the texture
+    full_frame_size = 0.0351  # 35 mm
+    sensor_dimension = 351
+    pixel_pitch = full_frame_size / sensor_dimension
+    point_source_intensity = 255
+    getTransmission = build_getTransmission()
+    photon_per_brightness_level = 10000
+    stdNoise = 1 / np.sqrt(photon_per_brightness_level)
+    num_repeats = 100
+
+    # Texture is a point source
+
+    sensor_coordinates = np.zeros((sensor_dimension, 2))
+    sensor_coordinates[:, 1] = (
+        np.arange(sensor_dimension) - sensor_dimension // 2
+    ) * pixel_pitch
+
+    Z_est_list = []
+    Z_true_list = []
+
+    if os.path.exists("./preCal_images.npy"):
+        preCal_images = np.load("./preCal_images.npy")
+    else:
+        preCal_images = []
+
+        for depth in WORKING_RANGE:
+            print(f"Simulating for depth: {depth:.2f} m")
+            y_diff = np.abs(sensor_coordinates[:, 1])
+            theta = np.rad2deg(np.arctan2(y_diff, depth))
+
+            theta_grid, d_grid = np.meshgrid(
+                theta, metasurface_distances, indexing="ij"
+            )
+            transmission = getTransmission(theta_grid, d_grid)
+            images = point_source_intensity * transmission
+
+            preCal_images.append(np.array(images).flatten())
+
+        preCal_images = np.array(preCal_images)
+        np.save("./preCal_images.npy", preCal_images)
+
+    for depth in WORKING_RANGE:
+        y_diff = np.abs(sensor_coordinates[:, 1])
+        theta = np.rad2deg(np.arctan2(y_diff, depth))
+
+        theta_grid, d_grid = np.meshgrid(theta, metasurface_distances, indexing="ij")
+        transmission = getTransmission(theta_grid, d_grid)
+        images = point_source_intensity * transmission
+        cleam_images = np.array(images).flatten()
+
+        for trial in range(num_repeats):
+            noise = (
+                np.random.normal(size=cleam_images.shape) * stdNoise * np.sqrt(abs(cleam_images))
+            )
+            noise_images = cleam_images + noise
+
+            diffs = preCal_images - noise_images[None, :]
+            costs = np.sum(diffs**2, axis=1)
+
+            best_idx = np.argmin(costs)
+            Z_est = WORKING_RANGE[best_idx]
+
+            Z_est_list.append(Z_est)
+            Z_true_list.append(depth)
+
+    plotSingleResult(
+        np.array(Z_est_list),
+        np.array(Z_true_list),
+        "./mmdp.png",
+        title="MMDP Optimization",
+    )
+
+
+def integer_shift_fft(a, b):
+    """
+    Returns the integer shift that best aligns b to a.
+    Positive δ means b is shifted right relative to a.
+    """
+    # Make sure both are the same length
+    n = len(a)
+    # FFTs
+    A = np.fft.fft(a)
+    B = np.fft.fft(b)
+    # Cross‐power spectrum
+    R = A * np.conj(B)
+    R /= np.abs(R) + 1e-12  # normalize to unit magnitude to do phase‐only
+    # Inverse FFT to get correlation
+    corr = np.fft.ifft(R)
+    # Find peak
+    shift = np.argmax(np.abs(corr))
+    # Wrap around into [−n/2, +n/2)
+    if shift > n//2:
+        shift -= n
+    return shift
+
+def simulation_stereo(params):
+    sensorDistance = params["sensorDistance"]
+    baseline = 2 * params["Sigma"]  # distance between the two cameras
+    photon_per_brightness_level = params["photon_per_brightness_level"]
+    stdNoise = 1 / np.sqrt(photon_per_brightness_level)
+    full_frame_size = 0.0351  # 35 mm
+    sensor_dimension = 351
+    pixel_pitch = full_frame_size / sensor_dimension
+    sensor = np.zeros(sensor_dimension)
+    sensor[sensor_dimension // 2] = 1  # Point source at the center
+
+    Z_est_list = []
+    Z_true_list = []
+
+    for depth in WORKING_RANGE:
+        # Ground-truth disparity
+        disparity_m = sensorDistance * baseline / depth
+        disparity_px = disparity_m / pixel_pitch
+
+        camera_1 = sensor.copy()
+        camera_2 = sp_shift(sensor, disparity_px, order=1, mode='constant', cval=0.0)
+
+        noise = (
+                np.random.normal(size=camera_1.shape) * stdNoise * np.sqrt(abs(camera_1))
+            )
+        camera_1_noisy = camera_1 + noise
+        noise = (
+                np.random.normal(size=camera_2.shape) * stdNoise * np.sqrt(abs(camera_2))
+            )
+        camera_2_noisy = camera_2 + noise
+
+        shift = integer_shift_fft(camera_1_noisy, camera_2_noisy)
+        print(f"Estimated shift: {shift}, True disparity (px): {disparity_px:.2f}")
+
+        # Convert shift to depth
+        depth_est = sensorDistance * baseline / (shift * pixel_pitch)
+        Z_est_list.append(depth_est)
+        Z_true_list.append(depth)
+    
+    Z_est_list = np.array(Z_est_list)
+    Z_true_list = np.array(Z_true_list)
+
+    plotSingleResult(
+        np.array(Z_est_list),
+        np.array(Z_true_list),
+        "./stereo.png",
+        title="Stereo Simulation",
+    )
+
+
+def simulation_stereo_hack(params):
+    sensorDistance = params["sensorDistance"]
+    baseline = 2 * params["Sigma"]  # distance between the two cameras
+    photon_per_brightness_level = params["photon_per_brightness_level"]
+    stdNoise = 1 / np.sqrt(photon_per_brightness_level)
+    full_frame_size = 0.0351  # 35 mm
+    sensor_dimension = 351
+    num_repeats = 100
+    pixel_pitch = full_frame_size / sensor_dimension
+    sensor = np.zeros(sensor_dimension)
+    sensor[sensor_dimension // 2] = 1  # Point source at the center
+
+    Z_est_list = []
+    Z_true_list = []
+
+    if os.path.exists("./preCal_images_stereo.npy"):
+        preCal_images = np.load("./preCal_images_stereo.npy")
+    else:
+        preCal_images = []
+
+        for depth in WORKING_RANGE:
+            print(f"Simulating for depth: {depth:.2f} m")
+            # Ground-truth disparity
+            disparity_m = sensorDistance * baseline / depth
+            disparity_px = disparity_m / pixel_pitch
+
+            camera_1 = sensor.copy()
+            camera_2 = sp_shift(sensor, disparity_px, order=1, mode='constant', cval=0.0)
+
+            preCal_images.append(np.array([camera_1, camera_2]).flatten())
+
+        preCal_images = np.array(preCal_images)
+        np.save("./preCal_images_stereo.npy", preCal_images)
+
+    for depth in WORKING_RANGE:
+        # Ground-truth disparity
+        disparity_m = sensorDistance * baseline / depth
+        disparity_px = disparity_m / pixel_pitch
+
+        camera_1 = sensor.copy()
+        camera_2 = sp_shift(sensor, disparity_px, order=1, mode='constant', cval=0.0)
+
+        for trial in range(num_repeats):
+            noise = (
+                    np.random.normal(size=camera_1.shape) * stdNoise * np.sqrt(abs(camera_1))
+                )
+            camera_1_noisy = camera_1 + noise
+            noise = (
+                    np.random.normal(size=camera_2.shape) * stdNoise * np.sqrt(abs(camera_2))
+                )
+            camera_2_noisy = camera_2 + noise
+            noise_images = np.array([camera_1_noisy, camera_2_noisy]).flatten()
+            diffs = preCal_images - noise_images[None, :]
+            costs = np.sum(diffs**2, axis=1)
+
+            best_idx = np.argmin(costs)
+            Z_est = WORKING_RANGE[best_idx]
+
+            Z_est_list.append(Z_est)
+            Z_true_list.append(depth)
+    
+    Z_est_list = np.array(Z_est_list)
+    Z_true_list = np.array(Z_true_list)
+
+    plotSingleResult(
+        np.array(Z_est_list),
+        np.array(Z_true_list),
+        "./stereo.png",
+        title="Stereo Simulation",
+    )
+
+
+def get_1d_psf(radius,
+               length,
+               pixel_pitch=PIXEL_PITCH,
+               nsigma=4,
+               spike_thresh=0.5):
+    sigma = float(radius)
+    # 1) if σ is much smaller than a pixel, just return a delta at center
+    if sigma < spike_thresh * pixel_pitch:
+        psf = np.zeros(length, dtype=float)
+        psf[length // 2] = 1.0
+        return psf
+
+    # 2) determine how many pixels cover ±nsigma·σ
+    half_support = int(np.ceil(nsigma * sigma / pixel_pitch))
+    # but don't exceed half the total length
+    half_support = min(half_support, length // 2)
+
+    # 3) sample x at those integer‐pixel offsets
+    offsets = np.arange(-half_support, half_support + 1)
+    x = offsets * pixel_pitch
+
+    # 4) compute the Gaussian and normalize
+    local = np.exp(-0.5 * (x / sigma) ** 2)
+    local /= local.sum()
+
+    # 5) embed back into full‐length array
+    psf = np.zeros(length, dtype=float)
+    start = (length // 2) - half_support
+    psf[start : start + local.size] = local
+
+    return psf
+
+
+def get_sigma(optical_power, sensor_distance, depth):
+    return 1 - sensor_distance * optical_power + sensor_distance / depth
+
+
+def get_depth_focaltrack(params, Laplacian_I, I_rho):
+    a = params["Sigma"] ** 2 * params["sensorDistance"] ** 2 * params["Delta_rho"]
+    b = (params["Sigma"] ** 2 * params["sensorDistance"] * params["Delta_rho"]) * (params["sensorDistance"] * params["rho"] - 1)
+    c = 1
+
+    depth = (a * Laplacian_I) / (b * Laplacian_I + c * I_rho)
+
+    return depth
+
+
+def simulation_focaltrack_hack(params):
+    rho = params["rho"]
+    Sigma = params["Sigma"]
+    Delta_rho = params["Delta_rho"]
+    sensorDistance = params["sensorDistance"]
+    photon_per_brightness_level = params["photon_per_brightness_level"]
+    stdNoise = 1 / np.sqrt(photon_per_brightness_level)
+    full_frame_size = 0.0351  # 35 mm
+    sensor_dimension = 351
+    pixel_pitch = full_frame_size / sensor_dimension
+    sensor = np.zeros(sensor_dimension)
+    sensor[sensor_dimension // 2] = 1  # Point source at the center
+    num_repeats = 100
+    
+    list_Z = []
+    list_Z_true = []
+
+    if os.path.exists("./preCal_images_focal_track.npy"):
+        preCal_images = np.load("./preCal_images_focal_track.npy")
+    else:
+        preCal_images = []
+
+        for depth in WORKING_RANGE:
+            print(f"Simulating for depth: {depth:.2f} m")
+            sigma = get_sigma(rho, sensorDistance, depth)
+            psf = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
+            image = np.convolve(sensor, psf, mode='same') / (sigma * Sigma)
+
+            sigma_plus = get_sigma(rho + Delta_rho, sensorDistance, depth)
+            psf_plus = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
+            image_plus = np.convolve(sensor, psf, mode='same')/ (sigma_plus * Sigma)
+
+            sigma_minus = get_sigma(rho - Delta_rho, sensorDistance, depth)
+            psf_minus = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
+            image_minus = np.convolve(sensor, psf, mode='same')/ (sigma_minus * Sigma)
+
+            preCal_images.append(np.array([image, image_plus, image_minus]).flatten())
+
+        preCal_images = np.array(preCal_images)
+        np.save("./preCal_images_focal_track.npy", preCal_images)
+
+    for depth in WORKING_RANGE:
+        sigma = get_sigma(rho, sensorDistance, depth)
+        psf = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
+        image = np.convolve(sensor, psf, mode='same')/ (sigma * Sigma)
+
+        sigma_plus = get_sigma(rho + Delta_rho, sensorDistance, depth)
+        psf_plus = get_1d_psf(sigma_plus * Sigma, sensor_dimension, pixel_pitch)
+        image_plus = np.convolve(sensor, psf_plus, mode='same')/ (sigma_plus * Sigma)
+
+        sigma_minus = get_sigma(rho - Delta_rho, sensorDistance, depth)
+        psf_minus = get_1d_psf(sigma_minus * Sigma, sensor_dimension, pixel_pitch)
+        image_minus = np.convolve(sensor, psf_minus, mode='same')/ (sigma_minus * Sigma)
+
+        for trial in range(num_repeats):
+            noise_image = image + np.random.normal(size=image.shape) * stdNoise * np.sqrt(abs(image))
+            noise_image_plus = image_plus + np.random.normal(size=image_plus.shape) * stdNoise * np.sqrt(abs(image_plus))
+            noise_image_minus = image_minus + np.random.normal(size=image_minus.shape) * stdNoise * np.sqrt(abs(image_minus))
+
+            noise_images = np.array([noise_image, noise_image_plus, noise_image_minus]).flatten()
+            diffs = preCal_images - noise_images[None, :]
+            costs = np.sum(diffs**2, axis=1)
+
+            best_idx = np.argmin(costs)
+            Z_est = WORKING_RANGE[best_idx]
+
+            list_Z.append(Z_est)
+            list_Z_true.append(depth)
+
+    list_Z = np.array(list_Z)
+    list_Z_true = np.array(list_Z_true)
+    plotSingleResult(
+        list_Z,
+        list_Z_true,
+        "./focal_track.png",
+        title="Focal Track Simulation",
+    )
+        
+
 def main():
+    params = {
+        "rho": 2.001,
+        "Sigma": 0.0175,
+        "Delta_rho": 0.0001,
+        "sensorDistance": 0.5,
+        "photon_per_brightness_level": 10000,
+        "kernelSize": 5,
+    }
+
+    # Check focal distance
+    # focal_distance = 1 / (params["rho"] - 1 / params["sensorDistance"])
+    # pdb.set_trace()
+
     # Test the getTransmission function
     # getTransmission = build_getTransmission()
     # angle = [0, 5, 10.0]
     # d = [10, 20, 30]
     # transmission = getTransmission(angle, d)
     # print(f"Transmission for angle {angle} and distance {d}: {transmission}")
-
-    simulation_mmdp()
+    # simulation_mmdp_hack()
+    # simulation_stereo_hack(params)
+    simulation_focaltrack_hack(params)
 
     return
 
