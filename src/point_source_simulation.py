@@ -10,8 +10,8 @@ import os
 PIXEL_PITCH = 5.86 * 1e-6
 SENSOR_SIZE = 200
 # WORKING_RANGE = np.linspace(0.30, 2.70, 81)
-WORKING_RANGE = np.linspace(1000, 10000, 91)
-# WORKING_RANGE = np.linspace(1, 1000, 100)
+# WORKING_RANGE = np.linspace(1000, 10000, 91)
+WORKING_RANGE = np.linspace(5, 505, 100)
 LAPLACIAN_KERNEL = np.array([-1, 2, -1]) / (PIXEL_PITCH**2)
 HEATMAP_RANGE = [
     [WORKING_RANGE.min(), WORKING_RANGE.max()],
@@ -205,6 +205,7 @@ def simulation_mmdp_hack():
         preCal_images = np.array(preCal_images)
         np.save("./preCal_images.npy", preCal_images)
 
+    mean_error = []
     for depth in WORKING_RANGE:
         y_diff = np.abs(sensor_coordinates[:, 1])
         theta = np.rad2deg(np.arctan2(y_diff, depth))
@@ -214,6 +215,7 @@ def simulation_mmdp_hack():
         images = point_source_intensity * transmission
         cleam_images = np.array(images).flatten()
 
+        error = []
         for trial in range(num_repeats):
             noise = (
                 np.random.normal(size=cleam_images.shape) * stdNoise * np.sqrt(abs(cleam_images))
@@ -225,9 +227,15 @@ def simulation_mmdp_hack():
 
             best_idx = np.argmin(costs)
             Z_est = WORKING_RANGE[best_idx]
+            error.append(np.abs(Z_est - depth))
 
             Z_est_list.append(Z_est)
             Z_true_list.append(depth)
+        mean_error.append(np.mean(error))
+
+    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+        range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
+        print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
 
     plotSingleResult(
         np.array(Z_est_list),
@@ -309,6 +317,28 @@ def simulation_stereo(params):
     )
 
 
+def gaussian_1d(length, sigma, oversampling=1, normalize=True):
+    """
+    Generate a 1D Gaussian vector of given length, using oversampling for accuracy.
+    The output is always 'length', regardless of oversampling.
+    """
+    if oversampling == 1:
+        # Standard case
+        x = np.arange(length) - (length - 1) / 2
+        g = np.exp(-0.5 * (x / sigma) ** 2)
+    else:
+        total_len = length * oversampling
+        center = (total_len - 1) / 2
+        x_hr = np.arange(total_len) - center
+        x_hr = x_hr / oversampling
+        g_hr = np.exp(-0.5 * (x_hr / sigma) ** 2)
+        # Downsample: average each oversampling block
+        g = g_hr.reshape(length, oversampling).sum(axis=1)
+    if normalize:
+        g /= g.sum()
+    return g
+
+
 def simulation_stereo_hack(params):
     sensorDistance = params["sensorDistance"]
     baseline = 2 * params["Sigma"]  # distance between the two cameras
@@ -320,6 +350,14 @@ def simulation_stereo_hack(params):
     pixel_pitch = full_frame_size / sensor_dimension
     sensor = np.zeros(sensor_dimension)
     sensor[sensor_dimension // 2] = 1  # Point source at the center
+    gaussian_psf = gaussian_1d(
+        sensor_dimension, 10, oversampling=5, normalize=True)
+    sensor = np.convolve(sensor, gaussian_psf, mode='same')
+
+    plt.figure(figsize=(10, 5))
+    ax = plt.subplot(1, 1, 1)
+    ax.plot(sensor, label='Image')
+    plt.show()
 
     Z_est_list = []
     Z_true_list = []
@@ -343,6 +381,7 @@ def simulation_stereo_hack(params):
         preCal_images = np.array(preCal_images)
         np.save("./preCal_images_stereo.npy", preCal_images)
 
+    mean_error = []
     for depth in WORKING_RANGE:
         # Ground-truth disparity
         disparity_m = sensorDistance * baseline / depth
@@ -351,6 +390,7 @@ def simulation_stereo_hack(params):
         camera_1 = sensor.copy()
         camera_2 = sp_shift(sensor, disparity_px, order=1, mode='constant', cval=0.0)
 
+        error = []
         for trial in range(num_repeats):
             noise = (
                     np.random.normal(size=camera_1.shape) * stdNoise * np.sqrt(abs(camera_1))
@@ -366,10 +406,16 @@ def simulation_stereo_hack(params):
 
             best_idx = np.argmin(costs)
             Z_est = WORKING_RANGE[best_idx]
+            error.append(np.abs(Z_est - depth))
 
             Z_est_list.append(Z_est)
             Z_true_list.append(depth)
+        mean_error.append(np.mean(error))
     
+    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+        range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
+        print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
+
     Z_est_list = np.array(Z_est_list)
     Z_true_list = np.array(Z_true_list)
 
@@ -383,30 +429,35 @@ def simulation_stereo_hack(params):
 
 def get_1d_psf(radius,
                length,
-               pixel_pitch=PIXEL_PITCH,
+               pixel_pitch,
                nsigma=4,
-               spike_thresh=0.5):
-    sigma = float(radius)
-    # 1) if σ is much smaller than a pixel, just return a delta at center
+               spike_thresh=0.5,
+               oversampling=50):
+    sigma = np.abs(float(radius))
+    eff_pixel_pitch = pixel_pitch / oversampling  # smaller steps
+
+    # 1) If σ is much smaller than a pixel, just return a delta at center
     if sigma < spike_thresh * pixel_pitch:
         psf = np.zeros(length, dtype=float)
         psf[length // 2] = 1.0
         return psf
 
-    # 2) determine how many pixels cover ±nsigma·σ
+    # 2) determine how many pixels cover ±nsigma·σ (in oversampled grid)
     half_support = int(np.ceil(nsigma * sigma / pixel_pitch))
-    # but don't exceed half the total length
     half_support = min(half_support, length // 2)
+    hr_half_support = half_support * oversampling
 
-    # 3) sample x at those integer‐pixel offsets
-    offsets = np.arange(-half_support, half_support + 1)
-    x = offsets * pixel_pitch
+    # 3) sample x at those integer-pixel offsets (oversampled)
+    offsets_hr = np.arange(-hr_half_support, hr_half_support + 1)
+    x_hr = offsets_hr * eff_pixel_pitch
 
-    # 4) compute the Gaussian and normalize
-    local = np.exp(-0.5 * (x / sigma) ** 2)
+    # 4) compute the Gaussian at high resolution
+    local_hr = np.exp(-0.5 * (x_hr / sigma) ** 2)
+    # Downsample by summing oversampling points for each base pixel
+    local = np.add.reduceat(local_hr, np.arange(0, len(local_hr), oversampling))
     local /= local.sum()
 
-    # 5) embed back into full‐length array
+    # 5) embed back into full-length array
     psf = np.zeros(length, dtype=float)
     start = (length // 2) - half_support
     psf[start : start + local.size] = local
@@ -454,34 +505,47 @@ def simulation_focaltrack_hack(params):
             print(f"Simulating for depth: {depth:.2f} m")
             sigma = get_sigma(rho, sensorDistance, depth)
             psf = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
-            image = np.convolve(sensor, psf, mode='same') / (sigma * Sigma)
+            image = np.convolve(sensor, psf, mode='same')
 
             sigma_plus = get_sigma(rho + Delta_rho, sensorDistance, depth)
             psf_plus = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
-            image_plus = np.convolve(sensor, psf, mode='same')/ (sigma_plus * Sigma)
+            image_plus = np.convolve(sensor, psf, mode='same')
 
             sigma_minus = get_sigma(rho - Delta_rho, sensorDistance, depth)
             psf_minus = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
-            image_minus = np.convolve(sensor, psf, mode='same')/ (sigma_minus * Sigma)
+            image_minus = np.convolve(sensor, psf, mode='same')
 
             preCal_images.append(np.array([image, image_plus, image_minus]).flatten())
 
         preCal_images = np.array(preCal_images)
         np.save("./preCal_images_focal_track.npy", preCal_images)
 
+    mean_error = []
     for depth in WORKING_RANGE:
         sigma = get_sigma(rho, sensorDistance, depth)
         psf = get_1d_psf(sigma * Sigma, sensor_dimension, pixel_pitch)
-        image = np.convolve(sensor, psf, mode='same')/ (sigma * Sigma)
+        image = np.convolve(sensor, psf, mode='same')
 
         sigma_plus = get_sigma(rho + Delta_rho, sensorDistance, depth)
         psf_plus = get_1d_psf(sigma_plus * Sigma, sensor_dimension, pixel_pitch)
-        image_plus = np.convolve(sensor, psf_plus, mode='same')/ (sigma_plus * Sigma)
+        image_plus = np.convolve(sensor, psf_plus, mode='same')
 
         sigma_minus = get_sigma(rho - Delta_rho, sensorDistance, depth)
         psf_minus = get_1d_psf(sigma_minus * Sigma, sensor_dimension, pixel_pitch)
-        image_minus = np.convolve(sensor, psf_minus, mode='same')/ (sigma_minus * Sigma)
+        image_minus = np.convolve(sensor, psf_minus, mode='same')
 
+        # plt.figure(figsize=(10, 5))
+        # ax = plt.subplot(1, 3, 1)
+        # ax.plot(image, label='Image')
+        # ax = plt.subplot(1, 3, 2)
+        # ax.plot(image_plus, label='Image + Delta_rho')
+        # ax = plt.subplot(1, 3, 3)
+        # ax.plot(image_minus, label='Image - Delta_rho')
+        # plt.show()
+
+        print("Radius in pixels:", np.abs(sigma * Sigma / pixel_pitch))
+
+        error = []
         for trial in range(num_repeats):
             noise_image = image + np.random.normal(size=image.shape) * stdNoise * np.sqrt(abs(image))
             noise_image_plus = image_plus + np.random.normal(size=image_plus.shape) * stdNoise * np.sqrt(abs(image_plus))
@@ -494,8 +558,15 @@ def simulation_focaltrack_hack(params):
             best_idx = np.argmin(costs)
             Z_est = WORKING_RANGE[best_idx]
 
+            error.append(np.abs(Z_est - depth))
+
             list_Z.append(Z_est)
             list_Z_true.append(depth)
+        mean_error.append(np.mean(error))
+
+    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+        range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
+        print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
 
     list_Z = np.array(list_Z)
     list_Z_true = np.array(list_Z_true)
@@ -509,10 +580,10 @@ def simulation_focaltrack_hack(params):
 
 def main():
     params = {
-        "rho": 2.001,
+        "rho": 0.9851,
         "Sigma": 0.0175,
-        "Delta_rho": 0.0001,
-        "sensorDistance": 0.5,
+        "Delta_rho": 0.00001,
+        "sensorDistance": 0.985,
         "photon_per_brightness_level": 10000,
         "kernelSize": 5,
     }
@@ -528,7 +599,7 @@ def main():
     # transmission = getTransmission(angle, d)
     # print(f"Transmission for angle {angle} and distance {d}: {transmission}")
     # simulation_mmdp_hack()
-    # simulation_stereo_hack(params)
+    simulation_stereo_hack(params)
     simulation_focaltrack_hack(params)
 
     return
