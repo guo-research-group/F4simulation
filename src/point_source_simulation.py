@@ -6,6 +6,7 @@ from scipy.optimize import minimize_scalar
 from scipy.ndimage import shift as sp_shift
 import matplotlib.pyplot as plt
 import os
+import matplotlib
 
 PIXEL_PITCH = 5.86 * 1e-6
 SENSOR_SIZE = 200
@@ -18,6 +19,19 @@ HEATMAP_RANGE = [
     [WORKING_RANGE.min(), WORKING_RANGE.max()],
 ]
 
+def set_matplotlib_params():
+    matplotlib.rcParams.update({
+        "font.size": 16,
+        "axes.labelsize": 16,
+        "axes.titlesize": 16,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "legend.fontsize": 14,
+        "figure.titlesize": 18,
+        "figure.figsize": (10, 10),
+    })
+
+set_matplotlib_params()
 
 def plotSingleResult(Z_est, Ztrue, pathname, title=None, normalisation=False):
 
@@ -233,7 +247,7 @@ def simulation_mmdp_hack():
             Z_true_list.append(depth)
         mean_error.append(np.mean(error))
 
-    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+    for error_rates in np.linspace(0.01, 0.10, 10):
         range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
         print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
 
@@ -241,7 +255,7 @@ def simulation_mmdp_hack():
         np.array(Z_est_list),
         np.array(Z_true_list),
         "./mmdp.png",
-        title="MMDP Optimization",
+        title="",
     )
 
 
@@ -412,7 +426,7 @@ def simulation_stereo_hack(params):
             Z_true_list.append(depth)
         mean_error.append(np.mean(error))
     
-    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+    for error_rates in np.linspace(0.01, 0.10, 10):
         range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
         print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
 
@@ -423,7 +437,7 @@ def simulation_stereo_hack(params):
         np.array(Z_est_list),
         np.array(Z_true_list),
         "./stereo.png",
-        title="Stereo Simulation",
+        title="",
     )
 
 
@@ -564,7 +578,7 @@ def simulation_focaltrack_hack(params):
             list_Z_true.append(depth)
         mean_error.append(np.mean(error))
 
-    for error_rates in [0.01, 0.03, 0.05, 0.1]:
+    for error_rates in np.linspace(0.01, 0.10, 10):
         range_length = np.count_nonzero(np.array(mean_error) / np.array(WORKING_RANGE) < error_rates) * (WORKING_RANGE[1] - WORKING_RANGE[0])
         print(f"Effective range for error rate {error_rates}: {range_length:.2f} m")
 
@@ -574,7 +588,7 @@ def simulation_focaltrack_hack(params):
         list_Z,
         list_Z_true,
         "./focal_track.png",
-        title="Focal Track Simulation",
+        title="",
     )
         
 
